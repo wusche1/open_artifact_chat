@@ -30,7 +30,8 @@ const uid = () => crypto.randomUUID().slice(0, 8);
 const load = (k, d) => JSON.parse(localStorage.getItem(k)) ?? d;
 const md = s => DOMPurify.sanitize(marked.parse(s));
 
-const state = load('state', { chats: {}, artifacts: {} });
+const state = load('state', { chats: {} });
+state.artifacts ??= {};
 const persist = () => localStorage.setItem('state', JSON.stringify(state));
 const running = {};
 let current = null;
