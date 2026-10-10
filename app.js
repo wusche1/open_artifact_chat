@@ -32,6 +32,7 @@ const md = s => DOMPurify.sanitize(marked.parse(s));
 
 const state = load('state', { chats: {} });
 state.artifacts ??= {};
+for (const c of Object.values(state.chats)) for (const m of c.messages) if (m.tool_calls) m.tool_calls = m.tool_calls.filter(Boolean);
 const persist = () => localStorage.setItem('state', JSON.stringify(state));
 const running = {};
 let current = null;
@@ -122,6 +123,7 @@ async function streamCompletion(chat, signal) {
   const msg = { role: 'assistant', content: '', reasoning: '' };
   chat.messages.push(msg);
   const reader = res.body.pipeThrough(new TextDecoderStream()).getReader();
+  const byIndex = {};
   let buf = '';
   for (;;) {
     const { value, done } = await reader.read();
@@ -137,9 +139,11 @@ async function streamCompletion(chat, signal) {
       if (!d) continue;
       msg.content += d.content ?? '';
       msg.reasoning += d.reasoning ?? '';
-      if (d.annotations) (msg.annotations ??= []).push(...d.annotations);
+      for (const a of d.annotations ?? [])
+        if (a.url_citation?.url && !msg.annotations?.some(x => x.url_citation.url === a.url_citation.url)) (msg.annotations ??= []).push(a);
       for (const t of d.tool_calls ?? []) {
-        const tc = ((msg.tool_calls ??= [])[t.index] ??= { id: '', type: 'function', function: { name: '', arguments: '' } });
+        let tc = byIndex[t.index];
+        if (!tc) (msg.tool_calls ??= []).push(tc = byIndex[t.index] = { id: '', type: 'function', function: { name: '', arguments: '' } });
         if (t.id) tc.id = t.id;
         tc.function.name += t.function?.name ?? '';
         tc.function.arguments += t.function?.arguments ?? '';
@@ -295,6 +299,7 @@ function renderMessage(m, results) {
   return v.el;
 }
 
+const workingIndicator = Object.assign(document.createElement('div'), { className: 'working', textContent: 'Working… (web searches can take a minute)' });
 const emptyState = Object.assign(document.createElement('div'), { className: 'empty', textContent: 'Start a conversation.' });
 
 function renderMessages() {
@@ -302,7 +307,8 @@ function renderMessages() {
   const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 80;
   const msgs = current.messages ?? [];
   const results = Object.fromEntries(msgs.filter(m => m.role === 'tool').map(m => [m.tool_call_id, m.content]));
-  syncChildren(box, msgs.length ? msgs.filter(m => m.role !== 'tool').map(m => renderMessage(m, results)) : [emptyState]);
+  const nodes = msgs.length ? msgs.filter(m => m.role !== 'tool').map(m => renderMessage(m, results)) : [emptyState];
+  syncChildren(box, running[current.id] ? [...nodes, workingIndicator] : nodes);
   if (atBottom) box.scrollTop = box.scrollHeight;
   $('#send').textContent = running[current.id] ? 'Stop' : 'Send';
 }

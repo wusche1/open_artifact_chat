@@ -60,3 +60,5 @@ details pre { max-height: 300px; overflow-y: auto; }
 #key-gate form { width: 100%; max-width: 420px; display: flex; flex-direction: column; gap: 12px; background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 24px; }
 #key-gate h2, #key-gate p { margin: 0; }
 #key-gate input { padding: 10px 12px; }
+.working { color: var(--muted); font-size: 13px; animation: pulse 1.5s ease-in-out infinite; }
+@keyframes pulse { 50% { opacity: .4; } }
