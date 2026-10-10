@@ -12,8 +12,7 @@ const fn = (name, description, properties, required = Object.keys(properties)) =
 const str = description => ({ type: 'string', description });
 
 const TOOLS = [
-  { type: 'openrouter:web_search' },
-  { type: 'openrouter:web_fetch' },
+  fn('web_search', 'Search the web. Returns the top results with page excerpts.', { query: str('Search query') }),
   fn('run_python', 'Run Python code (Pyodide, in the user\'s browser) and return stdout plus the value of the last expression. Packages like numpy and pandas are auto-loaded from imports.', { code: str('Python code') }),
   fn('create_artifact', 'Show the user a rendered HTML artifact in a side panel: web pages, apps, games, visualizations, diagrams, documents. Artifacts are shared across all chats. Pass a complete self-contained HTML document; libraries may be loaded from cdnjs or jsdelivr. To revise an artifact (including one made by another chat), call again with the same id and the full updated HTML.',
     { id: str('Short slug, reuse to update'), title: str('Title'), html: str('Full HTML document') }),
@@ -58,10 +57,25 @@ function runPython(code) {
   });
 }
 
-async function runTool(tc, chat) {
+async function webSearch(query, msg) {
+  const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${localStorage.getItem('apiKey')}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model: 'openai/gpt-4.1-nano', max_tokens: 16, plugins: [{ id: 'web', max_results: 5 }], messages: [{ role: 'user', content: query }] }),
+  });
+  const j = await res.json();
+  if (j.error) return `Search failed: ${j.error.message}`;
+  const annotations = j.choices[0].message.annotations ?? [];
+  for (const a of annotations)
+    if (!msg.annotations?.some(x => x.url_citation.url === a.url_citation.url)) (msg.annotations ??= []).push(a);
+  return annotations.map(({ url_citation: c }) => `## ${c.title}\n${c.url}\n${c.content ?? ''}`).join('\n\n') || 'No results.';
+}
+
+async function runTool(tc, chat, msg) {
   const args = JSON.parse(tc.function.arguments || '{}');
   switch (tc.function.name) {
     case 'run_python': return runPython(args.code);
+    case 'web_search': return webSearch(args.query, msg);
     case 'create_artifact':
       state.artifacts[args.id] = { title: args.title, html: args.html, chatId: chat.id, updated: Date.now() };
       if (chat === current) openArtifact(args);
@@ -92,7 +106,7 @@ async function runTool(tc, chat) {
 function systemPrompt(chat) {
   return `You are a helpful assistant. Today is ${new Date().toDateString()}.
 You are chat "${chat.title}" (id ${chat.id}). The user's other chats are other agents: you can list and message them, and all chats share the same artifacts.
-Use web search/fetch for anything current or uncertain and cite sources. Use run_python for computation.
+Use web_search for anything current or uncertain and cite sources. Use run_python for computation.
 Use create_artifact whenever the user wants something visual, interactive, or a substantial standalone document; don't repeat the artifact's code in your reply.
 ${chat.parent ? 'You are a subagent: do the task and end with a complete final answer, which is returned to your parent.' : 'Spawn subagents for independent or parallelizable subtasks.'}`;
 }
@@ -163,7 +177,7 @@ async function runAgent(chat) {
       const msg = await streamCompletion(chat, controller.signal);
       reply = msg.content;
       if (!msg.tool_calls?.length) break;
-      const results = await Promise.all(msg.tool_calls.map(tc => runTool(tc, chat)));
+      const results = await Promise.all(msg.tool_calls.map(tc => runTool(tc, chat, msg)));
       msg.tool_calls.forEach((tc, i) => chat.messages.push({ role: 'tool', tool_call_id: tc.id, content: results[i] }));
       render();
     }
@@ -247,6 +261,8 @@ function renderTool(v, tc, i, result) {
       card.onclick = () => openArtifact(args);
       return card;
     }
+    case 'web_search':
+      return setDetails(d('search'), `🔎 ${pending ? 'Searching' : 'Searched'}: ${partialField(raw, 'query') || '…'}`, result ?? '');
     case 'run_python':
       return setDetails(d('py'), pending ? '🐍 Running Python…' : '🐍 Ran Python', `${partialField(raw, 'code')}${pending ? '' : `\n\n── output ──\n${result}`}`);
     case 'spawn_subagent': {
@@ -299,7 +315,7 @@ function renderMessage(m, results) {
   return v.el;
 }
 
-const workingIndicator = Object.assign(document.createElement('div'), { className: 'working', textContent: 'Working… (web searches can take a minute)' });
+const workingIndicator = Object.assign(document.createElement('div'), { className: 'working', textContent: 'Working…' });
 const emptyState = Object.assign(document.createElement('div'), { className: 'empty', textContent: 'Start a conversation.' });
 
 function renderMessages() {
