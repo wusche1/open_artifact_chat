@@ -366,7 +366,23 @@ $('#model').onchange = e => {
   if (current.id) current.model = e.target.value;
 };
 $('#api-key').value = localStorage.getItem('apiKey') ?? '';
-$('#api-key').onchange = e => { localStorage.setItem('apiKey', e.target.value.trim()); render(); };
+$('#api-key').onchange = e => {
+  localStorage.setItem('apiKey', e.target.value.trim());
+  gate.hidden = !!e.target.value.trim();
+  render();
+};
+const gate = $('#key-gate');
+gate.hidden = !!localStorage.getItem('apiKey');
+gate.querySelector('form').onsubmit = async e => {
+  e.preventDefault();
+  const key = gate.querySelector('input').value.trim();
+  const res = await fetch('https://openrouter.ai/api/v1/key', { headers: { Authorization: `Bearer ${key}` } });
+  if (!res.ok) return gate.querySelector('.error').textContent = 'OpenRouter rejected that key.';
+  localStorage.setItem('apiKey', key);
+  $('#api-key').value = key;
+  gate.hidden = true;
+  render();
+};
 $('#new-chat').onclick = () => openChat({ projectId: current.projectId });
 $('#new-project').onclick = () => {
   const name = prompt('Project name');
