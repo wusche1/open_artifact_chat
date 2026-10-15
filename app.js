@@ -29,9 +29,21 @@ const uid = () => crypto.randomUUID().slice(0, 8);
 const load = (k, d) => JSON.parse(localStorage.getItem(k)) ?? d;
 const md = s => DOMPurify.sanitize(marked.parse(s));
 
+function pruneToolCalls(c) {
+  const answered = new Set(c.messages.map(m => m.tool_call_id));
+  for (const m of c.messages) if (m.tool_calls) {
+    m.tool_calls = m.tool_calls.filter(tc => tc && answered.has(tc.id));
+    if (!m.tool_calls.length) delete m.tool_calls;
+  }
+}
+
 const state = load('state', { chats: {} });
 state.artifacts ??= {};
-for (const c of Object.values(state.chats)) for (const m of c.messages) if (m.tool_calls) m.tool_calls = m.tool_calls.filter(Boolean);
+for (const c of Object.values(state.chats)) {
+  c.messages.push(...(c.queue ?? []));
+  delete c.queue;
+  pruneToolCalls(c);
+}
 const persist = () => localStorage.setItem('state', JSON.stringify(state));
 const running = {};
 let current = null;
@@ -45,21 +57,29 @@ function newChat(title, parent) {
 
 let pyWorker = null;
 const pyPending = {};
-function runPython(code) {
+const settlePython = (id, out) => { pyPending[id](out); delete pyPending[id]; };
+function runPython(code, signal) {
   if (!pyWorker) {
     pyWorker = new Worker('py-worker.js');
-    pyWorker.onmessage = ({ data }) => pyPending[data.id](data.out);
+    pyWorker.onmessage = ({ data }) => settlePython(data.id, data.out);
   }
   const id = uid();
   return new Promise(resolve => {
     pyPending[id] = resolve;
     pyWorker.postMessage({ id, code });
+    signal.addEventListener('abort', () => {
+      if (!pyPending[id]) return;
+      pyWorker.terminate();
+      pyWorker = null;
+      for (const k in pyPending) settlePython(k, 'Python was interrupted.');
+    });
   });
 }
 
-async function webSearch(query, msg) {
+async function webSearch(query, msg, signal) {
   const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
     method: 'POST',
+    signal,
     headers: { Authorization: `Bearer ${localStorage.getItem('apiKey')}`, 'Content-Type': 'application/json' },
     body: JSON.stringify({ model: 'openai/gpt-4.1-nano', max_tokens: 16, plugins: [{ id: 'web', max_results: 5 }], messages: [{ role: 'user', content: query }] }),
   });
@@ -71,11 +91,17 @@ async function webSearch(query, msg) {
   return annotations.map(({ url_citation: c }) => `## ${c.title}\n${c.url}\n${c.content ?? ''}`).join('\n\n') || 'No results.';
 }
 
-async function runTool(tc, chat, msg) {
+const runLinked = (chat, signal) => {
+  const p = runAgent(chat);
+  signal.addEventListener('abort', () => running[chat.id]?.abort());
+  return p;
+};
+
+async function runTool(tc, chat, msg, signal) {
   const args = JSON.parse(tc.function.arguments || '{}');
   switch (tc.function.name) {
-    case 'run_python': return runPython(args.code);
-    case 'web_search': return webSearch(args.query, msg);
+    case 'run_python': return runPython(args.code, signal);
+    case 'web_search': return webSearch(args.query, msg, signal);
     case 'create_artifact':
       state.artifacts[args.id] = { title: args.title, html: args.html, chatId: chat.id, updated: Date.now() };
       if (chat === current) openArtifact(args);
@@ -91,13 +117,13 @@ async function runTool(tc, chat, msg) {
       if (!target) return 'No such chat.';
       if (running[target.id]) return 'That agent is busy right now.';
       target.messages.push({ role: 'user', content: `[Message from chat "${chat.title}" (${chat.id})]\n${args.message}` });
-      return runAgent(target);
+      return runLinked(target, signal);
     }
     case 'spawn_subagent': {
       const sub = newChat(`🤖 ${args.title}`, chat.id);
       sub.model = args.model || chat.model;
       sub.messages.push({ role: 'user', content: args.task });
-      return runAgent(sub);
+      return runLinked(sub, signal);
     }
   }
   return `Unknown tool ${tc.function.name}`;
@@ -123,6 +149,7 @@ async function streamCompletion(chat, signal) {
     },
     body: JSON.stringify({
       model: chat.model,
+      provider: chat.avoid?.length ? { ignore: chat.avoid } : undefined,
       stream: true,
       tools: chat.parent ? TOOLS : [...TOOLS, SPAWN],
       messages: [
@@ -148,6 +175,7 @@ async function streamCompletion(chat, signal) {
     for (const line of lines) {
       if (!line.startsWith('data: ') || line === 'data: [DONE]') continue;
       const chunk = JSON.parse(line.slice(6));
+      msg.provider ??= chunk.provider;
       if (chunk.error) throw new Error(chunk.error.message);
       const d = chunk.choices?.[0]?.delta;
       if (!d) continue;
@@ -168,27 +196,42 @@ async function streamCompletion(chat, signal) {
   return msg;
 }
 
+const STOPPED = 'Stopped by user.';
 async function runAgent(chat) {
   const controller = running[chat.id] = new AbortController();
   render();
   let reply = '';
+  let retries = 0;
   try {
     for (;;) {
-      const msg = await streamCompletion(chat, controller.signal);
+      chat.messages.push(...(chat.queue?.splice(0) ?? []));
+      let msg;
+      try {
+        msg = await streamCompletion(chat, controller.signal);
+      } catch (e) {
+        const partial = chat.messages.at(-1);
+        if (e.name === 'AbortError' || !partial.provider || ++retries > 3) throw e;
+        chat.messages.pop();
+        (chat.avoid ??= []).push(partial.provider);
+        continue;
+      }
       reply = msg.content;
-      if (!msg.tool_calls?.length) break;
-      const results = await Promise.all(msg.tool_calls.map(tc => runTool(tc, chat, msg)));
-      msg.tool_calls.forEach((tc, i) => chat.messages.push({ role: 'tool', tool_call_id: tc.id, content: results[i] }));
-      render();
+      if (!msg.tool_calls?.length) {
+        if (chat.queue?.length) continue;
+        break;
+      }
+      await Promise.all(msg.tool_calls.map(async tc => {
+        chat.messages.push({ role: 'tool', tool_call_id: tc.id, content: await runTool(tc, chat, msg, controller.signal).catch(e => `Error: ${e.message}`) });
+        render();
+      }));
     }
   } catch (e) {
-    const last = chat.messages.at(-1);
-    if (last.role === 'assistant') delete last.tool_calls;
-    reply = e.name === 'AbortError' ? 'Stopped by user.' : `Error: ${e.message}`;
+    pruneToolCalls(chat);
+    reply = e.name === 'AbortError' ? STOPPED : `Error: ${e.message}`;
     if (e.name !== 'AbortError') chat.messages.push({ role: 'assistant', error: e.message });
   }
+  chat.messages.push(...(chat.queue?.splice(0) ?? []));
   delete running[chat.id];
-  chat.updated = Date.now();
   persist();
   render();
   return reply || '(no reply)';
@@ -196,9 +239,14 @@ async function runAgent(chat) {
 
 function send(text) {
   if (!localStorage.getItem('apiKey')) return alert('Add your OpenRouter key in the sidebar first.');
+  stick = true;
   if (!current.id) current = newChat(text.slice(0, 50));
-  current.messages.push({ role: 'user', content: text });
-  runAgent(current);
+  current.updated = Date.now();
+  const msg = { role: 'user', content: text };
+  if (running[current.id]) (current.queue ??= []).push(msg);
+  else current.messages.push(msg), runAgent(current);
+  persist();
+  render();
 }
 
 const STORAGE_SHIM = `<script>try{localStorage}catch(e){const m=()=>{const d={};return{getItem:k=>k in d?d[k]:null,setItem:(k,v)=>{d[k]=String(v)},removeItem:k=>{delete d[k]},clear:()=>{for(const k in d)delete d[k]},key:i=>Object.keys(d)[i]??null,get length(){return Object.keys(d).length}}};Object.defineProperty(window,'localStorage',{value:m()});Object.defineProperty(window,'sessionStorage',{value:m()})}<\/script>`;
@@ -267,14 +315,14 @@ function renderTool(v, tc, i, result) {
       return setDetails(d('py'), pending ? '🐍 Running Python…' : '🐍 Ran Python', `${partialField(raw, 'code')}${pending ? '' : `\n\n── output ──\n${result}`}`);
     case 'spawn_subagent': {
       const title = partialField(raw, 'title');
-      const el = setDetails(d('sub'), `${pending ? '⏳' : '✅'} Subagent: ${title || '…'}`, `${partialField(raw, 'task')}${pending ? '' : `\n\n── result ──\n${result}`}`);
+      const el = setDetails(d('sub'), `${pending ? '⏳' : result === STOPPED ? '⏹️' : '✅'} Subagent: ${title || '…'}`, `${partialField(raw, 'task')}${pending ? '' : `\n\n── result ──\n${result}`}`);
       const sub = Object.values(state.chats).find(c => c.parent === current.id && c.title === `🤖 ${title}`);
       if (sub && !el.querySelector('a')) el.querySelector('summary').append(Object.assign(document.createElement('a'), { textContent: ' open', href: '#', onclick: e => { e.preventDefault(); openChat(sub); } }));
       return el;
     }
     case 'send_message': {
       const id = partialField(raw, 'chat_id');
-      return setDetails(d('msg'), `${pending ? '⏳' : '✉️'} Message to ${state.chats[id]?.title ?? (id || '…')}`, `${partialField(raw, 'message')}${pending ? '' : `\n\n── reply ──\n${result}`}`);
+      return setDetails(d('msg'), `${pending ? '⏳' : result === STOPPED ? '⏹️' : '✉️'} Message to ${state.chats[id]?.title ?? (id || '…')}`, `${partialField(raw, 'message')}${pending ? '' : `\n\n── reply ──\n${result}`}`);
     }
   }
   return setDetails(d('tool'), `🔧 ${tc.function.name}`, `${raw}${pending ? '' : `\n\n${result}`}`);
@@ -318,16 +366,21 @@ function renderMessage(m, results) {
 const workingIndicator = Object.assign(document.createElement('div'), { className: 'working', textContent: 'Working…' });
 const emptyState = Object.assign(document.createElement('div'), { className: 'empty', textContent: 'Start a conversation.' });
 
+let stick = false;
 function renderMessages() {
   const box = $('#messages');
-  const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 80;
+  const atBottom = stick || box.scrollHeight - box.scrollTop - box.clientHeight < 80;
+  stick = false;
   const msgs = current.messages ?? [];
   const results = Object.fromEntries(msgs.filter(m => m.role === 'tool').map(m => [m.tool_call_id, m.content]));
-  const nodes = msgs.length ? msgs.filter(m => m.role !== 'tool').map(m => renderMessage(m, results)) : [emptyState];
+  const shown = [...msgs.filter(m => m.role !== 'tool'), ...(current.queue ?? [])];
+  const nodes = shown.length ? shown.map(m => renderMessage(m, results)) : [emptyState];
   syncChildren(box, running[current.id] ? [...nodes, workingIndicator] : nodes);
   if (atBottom) box.scrollTop = box.scrollHeight;
-  $('#send').textContent = running[current.id] ? 'Stop' : 'Send';
+  updateSend();
 }
+
+const updateSend = () => $('#send').textContent = running[current.id] && !input.value.trim() ? 'Stop' : 'Send';
 
 function chatItem(c, depth) {
   const el = document.createElement('div');
@@ -346,15 +399,19 @@ function chatItem(c, depth) {
   return el;
 }
 
+let sidebarKey = '';
 function renderSidebar() {
-  const list = $('#chat-list');
-  list.replaceChildren();
   const chats = Object.values(state.chats).sort((a, b) => b.updated - a.updated);
+  const items = [];
   const addTree = (parent, depth) => chats.filter(c => (c.parent ?? null) === parent).forEach(c => {
-    list.append(chatItem(c, depth));
+    items.push([c, depth]);
     addTree(c.id, depth + 1);
   });
   addTree(null, 0);
+  const key = JSON.stringify([current.id, items.map(([c, d]) => [c.id, c.title, d, !!running[c.id]])]);
+  if (key === sidebarKey) return;
+  sidebarKey = key;
+  $('#chat-list').replaceChildren(...items.map(([c, d]) => chatItem(c, d)));
 }
 
 function renderArtifactMenu() {
@@ -376,6 +433,7 @@ function render() {
 
 function openChat(chat) {
   current = chat;
+  stick = true;
   if (chat.model) $('#model').value = chat.model;
   $('#artifact').hidden = true;
   render();
@@ -410,6 +468,12 @@ if (hashKey) {
   $('#api-key').value = hashKey;
   history.replaceState(null, '', location.pathname);
 }
+navigator.locks.request('open-artifact-chat', { ifAvailable: true }, lock => {
+  if (lock) return new Promise(() => {});
+  $('#other-tab').hidden = false;
+  navigator.locks.request('open-artifact-chat', () => location.reload());
+});
+
 const gate = $('#key-gate');
 gate.hidden = !!localStorage.getItem('apiKey');
 gate.querySelector('form').onsubmit = async e => {
@@ -450,14 +514,14 @@ $('#art-download').onclick = () => {
 };
 
 const input = $('#input');
-input.oninput = () => { input.style.height = 'auto'; input.style.height = input.scrollHeight + 'px'; };
+input.oninput = () => { input.style.height = 'auto'; input.style.height = input.scrollHeight + 2 + 'px'; input.style.overflowY = input.scrollHeight > 200 ? 'auto' : 'hidden'; updateSend(); };
 input.onkeydown = e => {
   if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); $('#composer').requestSubmit(); }
 };
 $('#composer').onsubmit = e => {
   e.preventDefault();
-  if (running[current.id]) return running[current.id].abort();
   const text = input.value.trim();
+  if (running[current.id] && !text) return running[current.id].abort();
   if (!text) return;
   input.value = '';
   input.oninput();

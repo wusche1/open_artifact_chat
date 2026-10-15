@@ -1,7 +1,10 @@
 importScripts('https://cdn.jsdelivr.net/pyodide/v0.27.2/full/pyodide.js');
 const ready = loadPyodide();
 
-onmessage = async ({ data: { id, code } }) => {
+let queue = Promise.resolve();
+onmessage = e => queue = queue.then(() => run(e.data));
+
+async function run({ id, code }) {
   const py = await ready;
   let out = '';
   py.setStdout({ batched: s => out += s + '\n' });
@@ -14,4 +17,4 @@ onmessage = async ({ data: { id, code } }) => {
     out += e.message;
   }
   postMessage({ id, out: out || '(no output)' });
-};
+}
